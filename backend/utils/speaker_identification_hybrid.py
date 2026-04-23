@@ -11,8 +11,7 @@ class SpeakerName(BaseModel):
 
     @validator('name')
     def name_must_be_valid(cls, v):
-        # Noise word filtering (case-insensitive)
-        # Added common hallucinations and generic terms as requested by security audit
+        # Filter out common noise words and generic nouns
         v_lower = v.lower().strip()
         noise_words = {
             'am', 'is', 'are', 'was', 'were', 'my', 'name', 'me', 'i', 'the', 'a', 'an',
@@ -26,10 +25,8 @@ class SpeakerName(BaseModel):
         
         # English: Must be alphabetic, start with uppercase, at least 2 chars
         if re.match(r'^[a-zA-Z\s]+$', v):
-            # Ensure it's not just a single letter like 'A' (min_length covers this, but just in case)
             if len(v.strip()) < 2:
                 raise ValueError('Name too short')
-            # For multi-word names, each should be capitalized
             parts = v.strip().split()
             if not all(p[0].isupper() for p in parts if p):
                 raise ValueError('Each part of English name must start with uppercase')
@@ -38,13 +35,12 @@ class SpeakerName(BaseModel):
             if len(v) < 2 or len(v) > 4:
                 raise ValueError('Chinese name must be 2-4 characters')
         else:
-            # For other languages, just ensure it starts with an uppercase/special char
             if not re.match(r'^[A-Z\u0370-\u03ff\u1f00-\u1fff\u0400-\u04ff\u0900-\u097F\uac00-\ud7a3\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]', v):
                 raise ValueError('Name must start with an uppercase letter or a valid language-specific character')
             
         return v.strip()
 
-# All language patterns moved here to centralize Stage 1 detection
+# Centralized regex patterns for various languages (Stage 1)
 SPEAKER_PATTERNS = {
     'bg': [r"\b(?:Аз съм|аз съм|Казвам се|казвам се|Името ми е|името ми е)\s+([А-Я][а-я]*)\b"],
     'ca': [r"\b(?:Sóc|sóc|Em dic|em dic|El meu nom és|el meu nom és)\s+([A-Z][a-zA-Z]*)\b"],
@@ -102,7 +98,6 @@ def _detect_from_regex(text: str, language: Optional[str] = None) -> Optional[st
     if language and language in SPEAKER_PATTERNS:
         patterns = SPEAKER_PATTERNS[language]
     else:
-        # Check all patterns if language is unknown or not explicitly supported
         patterns = []
         for lang_patterns in SPEAKER_PATTERNS.values():
             patterns.extend(lang_patterns)
@@ -112,11 +107,9 @@ def _detect_from_regex(text: str, language: Optional[str] = None) -> Optional[st
         if match:
             groups = match.groups()
             if groups:
-                # Use the last group as the name
                 name = groups[-1].strip(",.!? ")
                 try:
                     validated = SpeakerName(name=name)
-                    # For English, ensure first char is upper, others lower
                     if re.match(r'^[a-zA-Z\s]+$', validated.name):
                         return " ".join([p.capitalize() for p in validated.name.split()])
                     return validated.name
@@ -125,12 +118,7 @@ def _detect_from_regex(text: str, language: Optional[str] = None) -> Optional[st
     return None
 
 async def _detect_from_ner(text: str, language: str = 'en') -> Optional[str]:
-    """
-    Stage 2: Named Entity Recognition (Lightweight LLM)
-    """
-    # Only run LLM if there's a potential introduction signal to save tokens/costs.
-    # We strictly avoid common words like 'am' to prevent excessive triggering.
-    # Gate logic: must contain one of these specific intro signals.
+    """Stage 2: Named Entity Recognition via lightweight LLM fallback"""
     signal_keywords = [
         'my name is', "i'm", 'call me', 'here', '我是', '我叫', '名字', 
         'introducing', 'this is', 'speaking', 'self-introduction'
@@ -154,25 +142,32 @@ async def _detect_from_ner(text: str, language: str = 'en') -> Optional[str]:
         logger.error(f"Error in Stage 2 (NER) extraction: {e}")
         return None
 
+async def _contextual_arbiter(text: str, current_name: str) -> bool:
+    """Stage 3: LLM Contextual Arbiter (Validation)"""
+    prompt = f"In the following transcript segment, is '{current_name}' clearly the name of the speaker who is introducing themselves? Segment: \"{text}\". Respond only with 'YES' or 'NO'."
+    try:
+        response = await llm_mini.ainvoke(prompt)
+        return response.content.strip().upper() == 'YES'
+    except Exception:
+        return True
+
 async def detect_speaker_hybrid(text: str, language: str = 'en') -> Optional[str]:
-    """
-    Hybrid Speaker Identification Engine (Async)
-    Stage 1: Regex (Fast, No Cost)
-    Stage 2: LLM NER (Contextual, Fallback)
-    """
+    """Hybrid detection engine: Stage 1 (Regex) -> Stage 2 (NER Fallback) -> Stage 3 (Arbiter)"""
     if not text or len(text) < 5:
         return None
 
-    # 1. Regex Match (Includes multi-language support)
+    # 1. Regex Match
     name = _detect_from_regex(text, language)
-    if name:
-        return name
-
-    # 2. NER / LLM Fallback (Mostly for EN/ZH currently)
-    # We only enable LLM for high-signal languages to optimize ROI
-    if language in ['en', 'zh', 'multi']:
+    
+    # 2. NER / LLM Fallback
+    if not name and language in ['en', 'zh', 'multi']:
         name = await _detect_from_ner(text, language)
-        if name:
-            return name
+    
+    if not name:
+        return None
+        
+    # 3. Validation Arbiter
+    if await _contextual_arbiter(text, name):
+        return name
 
     return None
